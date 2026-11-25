@@ -12,11 +12,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
 type App struct {
 	db      *sql.DB
 	baseURL string
+	google  *oauth2.Config // nil when Google sign-in isn't configured
+	demo    bool           // allow the sample accounts without signing in
+	secure  bool           // send cookies over HTTPS only
 }
 
 type User struct {
@@ -29,6 +34,10 @@ type User struct {
 	Phone          string         `json:"phone"`
 	Email          string         `json:"email"`
 	SendMode       string         `json:"send_mode"`
+	GoogleSub      string         `json:"-"`
+	Picture        string         `json:"picture"`
+	Onboarded      bool           `json:"onboarded"`
+	InviteCode     sql.NullString `json:"-"`
 }
 
 func (u User) MarshalJSON() ([]byte, error) {
@@ -37,7 +46,16 @@ func (u User) MarshalJSON() ([]byte, error) {
 		alias
 		Dealership   string `json:"dealership"`
 		FacebookPage string `json:"facebook_page"`
-	}{alias(u), u.DealershipName.String, u.FacebookPage.String})
+		Demo         bool   `json:"demo"`
+		InviteCode   string `json:"invite_code,omitempty"`
+	}{alias(u), u.DealershipName.String, u.FacebookPage.String, u.GoogleSub == "", inviteFor(u)})
+}
+
+func inviteFor(u User) string {
+	if u.Role == "manager" {
+		return u.InviteCode.String
+	}
+	return ""
 }
 
 type Customer struct {
@@ -63,16 +81,23 @@ type querier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-const userCols = `u.id, u.name, u.role, u.dealership_id, COALESCE(d.name, NULLIF(u.workplace, '')), d.facebook_page, u.phone, u.email, u.send_mode`
+const userCols = `u.id, u.name, u.role, u.dealership_id, COALESCE(d.name, NULLIF(u.workplace, '')), d.facebook_page, u.phone, u.email, u.send_mode,
+	u.google_sub, u.picture, u.onboarded, d.invite_code`
 
-func loadUser(q querier, id int64) (User, error) {
+func scanUser(sc interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := q.QueryRow(`SELECT `+userCols+` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.id = ?`, id).
-		Scan(&u.ID, &u.Name, &u.Role, &u.DealershipID, &u.DealershipName, &u.FacebookPage, &u.Phone, &u.Email, &u.SendMode)
+	err := sc.Scan(&u.ID, &u.Name, &u.Role, &u.DealershipID, &u.DealershipName, &u.FacebookPage, &u.Phone, &u.Email, &u.SendMode,
+		&u.GoogleSub, &u.Picture, &u.Onboarded, &u.InviteCode)
 	return u, err
 }
 
+func loadUser(q querier, id int64) (User, error) {
+	return scanUser(q.QueryRow(`SELECT `+userCols+` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.id = ?`, id))
+}
+
 func (a *App) routes(mux *http.ServeMux) {
+	a.authRoutes(mux)
+	mux.HandleFunc("POST /api/onboarding", a.withUser(a.onboard))
 	mux.HandleFunc("GET /api/users", a.listUsers)
 	mux.HandleFunc("GET /api/me", a.withUser(a.getMe))
 	mux.HandleFunc("PATCH /api/me", a.withUser(a.patchMe))
@@ -141,17 +166,29 @@ func pathID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
-// withUser resolves the demo user from the X-User header. This demo has no
-// passwords: anyone can switch between the sample accounts.
+// withUser resolves the signed-in user from the session cookie. In demo mode,
+// a request with no session may pick one of the sample accounts with the
+// X-User header; real (Google) accounts can never be reached that way.
 func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, _ := strconv.ParseInt(r.Header.Get("X-User"), 10, 64)
-		if id == 0 {
-			id = 1
+		var u User
+		var err error
+		if id := a.sessionUserID(r); id != 0 {
+			u, err = loadUser(a.db, id)
+		} else if demoID, _ := strconv.ParseInt(r.Header.Get("X-User"), 10, 64); a.demo && demoID != 0 {
+			u, err = loadUser(a.db, demoID)
+			if err == nil && u.GoogleSub != "" {
+				err = sql.ErrNoRows
+			}
+		} else {
+			err = sql.ErrNoRows
 		}
-		u, err := loadUser(a.db, id)
 		if err != nil {
-			writeErr(w, httpError{http.StatusUnauthorized, "unknown user"})
+			writeErr(w, httpError{http.StatusUnauthorized, "please sign in"})
+			return
+		}
+		if !u.Onboarded && r.URL.Path != "/api/me" && r.URL.Path != "/api/onboarding" {
+			writeErr(w, httpError{http.StatusForbidden, "finish setting up your account first"})
 			return
 		}
 		if err := h(w, r, u); err != nil {
@@ -213,17 +250,22 @@ func today() string { return time.Now().Format("2006-01-02") }
 
 // ---- users ----
 
+// listUsers lists the sample accounts for the demo switcher.
 func (a *App) listUsers(w http.ResponseWriter, r *http.Request) {
-	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id ORDER BY u.id`)
+	users := []User{}
+	if !a.demo {
+		writeJSON(w, users)
+		return
+	}
+	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.google_sub = '' ORDER BY u.id`)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	defer rows.Close()
-	users := []User{}
 	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.ID, &u.Name, &u.Role, &u.DealershipID, &u.DealershipName, &u.FacebookPage, &u.Phone, &u.Email, &u.SendMode); err != nil {
+		u, err := scanUser(rows)
+		if err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -754,6 +796,7 @@ func (a *App) autoSend() {
 func (a *App) autoSendLoop() {
 	for {
 		a.autoSend()
+		a.cleanSessions()
 		time.Sleep(time.Minute)
 	}
 }
