@@ -1,0 +1,28 @@
+# fly.io config. Change `app` to your own unique name before the first deploy.
+app = "ref-referral-demo"
+primary_region = "lax"
+
+[build]
+
+[env]
+  PORT = "8080"
+  DB_PATH = "/data/ref.db"
+  TZ = "America/Los_Angeles"
+  # Set to your app's public address so referral links point to it:
+  BASE_URL = "https://ref-referral-demo.fly.dev"
+
+[mounts]
+  source = "ref_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
