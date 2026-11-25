@@ -10,22 +10,23 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-
-	"golang.org/x/oauth2"
 )
 
-// fakeGoogle stands in for Google's OAuth and userinfo endpoints.
-func fakeGoogle(t *testing.T, sub, email string) *httptest.Server {
+// fakeAuth0 stands in for Auth0's authorize, token and userinfo endpoints.
+func fakeAuth0(t *testing.T, sub, email string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if q.Get("code_challenge") == "" {
 			t.Error("missing PKCE challenge")
 		}
+		if q.Get("screen_hint") != "signup" {
+			t.Error("missing sign-up hint")
+		}
 		http.Redirect(w, r, q.Get("redirect_uri")+"?code=good&state="+url.QueryEscape(q.Get("state")), http.StatusFound)
 	})
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		if r.Form.Get("code") != "good" || r.Form.Get("code_verifier") == "" {
 			http.Error(w, "bad code", http.StatusBadRequest)
@@ -39,7 +40,7 @@ func fakeGoogle(t *testing.T, sub, email string) *httptest.Server {
 			http.Error(w, "no", http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"sub": sub, "email": email, "email_verified": true, "name": "Test Seller"})
+		json.NewEncoder(w).Encode(map[string]any{"sub": sub, "email": email, "name": "Test Seller"})
 	})
 	return httptest.NewServer(mux)
 }
@@ -71,18 +72,19 @@ func newTestApp(t *testing.T, demo bool) (*httptest.Server, *App) {
 
 func signIn(t *testing.T, srv *httptest.Server, app *App, sub, email string) *http.Client {
 	t.Helper()
-	g := fakeGoogle(t, sub, email)
+	g := fakeAuth0(t, sub, email)
 	t.Cleanup(g.Close)
-	userInfoURL = g.URL + "/userinfo"
-	app.google = &oauth2.Config{
-		ClientID: "id", ClientSecret: "secret",
-		RedirectURL: srv.URL + "/auth/google/callback",
-		Scopes:      []string{"openid", "email", "profile"},
-		Endpoint:    oauth2.Endpoint{AuthURL: g.URL + "/auth", TokenURL: g.URL + "/token"},
+	t.Setenv("AUTH0_DOMAIN", strings.TrimPrefix(g.URL, "http://"))
+	t.Setenv("AUTH0_CLIENT_ID", "id")
+	t.Setenv("AUTH0_CLIENT_SECRET", "secret")
+	app.auth = newAuth0(srv.URL)
+	// The fake server speaks plain HTTP.
+	for _, u := range []*string{&app.auth.oauth.Endpoint.AuthURL, &app.auth.oauth.Endpoint.TokenURL, &app.auth.userInfoURL} {
+		*u = strings.Replace(*u, "https://", "http://", 1)
 	}
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar}
-	res, err := c.Get(srv.URL + "/auth/google/login")
+	res, err := c.Get(srv.URL + "/auth/login?signup=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +112,11 @@ func call(t *testing.T, c *http.Client, method, url, body string, header ...stri
 	return res.StatusCode, out
 }
 
-func TestGoogleSignInAndDealershipOnboarding(t *testing.T) {
+func TestSignInAndDealershipOnboarding(t *testing.T) {
 	srv, app := newTestApp(t, true)
 
 	// Manager signs up and creates a dealership.
-	mgr := signIn(t, srv, app, "google-mgr", "mgr@example.com")
+	mgr := signIn(t, srv, app, "auth0|mgr", "mgr@example.com")
 	code, me := call(t, mgr, "GET", srv.URL+"/api/me", "")
 	if code != 200 || me["onboarded"] != false || me["demo"] != false {
 		t.Fatalf("new user: %d %v", code, me)
@@ -129,7 +131,7 @@ func TestGoogleSignInAndDealershipOnboarding(t *testing.T) {
 	}
 
 	// Salesperson joins with the invite code and adds a customer.
-	rep := signIn(t, srv, app, "google-rep", "rep@example.com")
+	rep := signIn(t, srv, app, "google-oauth2|rep", "rep@example.com")
 	if code, _ := call(t, rep, "POST", srv.URL+"/api/onboarding", `{"plan":"join","invite_code":"WRONGONE"}`); code != 400 {
 		t.Fatalf("bad invite accepted: %d", code)
 	}
@@ -153,13 +155,16 @@ func TestGoogleSignInAndDealershipOnboarding(t *testing.T) {
 	}
 
 	// Signing in again reuses the same account.
-	again := signIn(t, srv, app, "google-mgr", "mgr@example.com")
+	again := signIn(t, srv, app, "auth0|mgr", "mgr@example.com")
 	if _, me := call(t, again, "GET", srv.URL+"/api/me", ""); me["role"] != "manager" {
 		t.Fatalf("second sign-in got %v", me)
 	}
 
-	// Sign out ends the session.
-	call(t, mgr, "POST", srv.URL+"/auth/logout", "")
+	// Sign out ends the session and hands back Auth0's logout URL.
+	_, out := call(t, mgr, "POST", srv.URL+"/auth/logout", "")
+	if lu, _ := out["logout_url"].(string); !strings.Contains(lu, "/v2/logout?") || !strings.Contains(lu, "returnTo=") {
+		t.Fatalf("logout_url = %q", lu)
+	}
 	if code, _ := call(t, mgr, "GET", srv.URL+"/api/me", ""); code != 401 {
 		t.Fatalf("after logout: %d", code)
 	}
@@ -167,9 +172,9 @@ func TestGoogleSignInAndDealershipOnboarding(t *testing.T) {
 
 func TestDemoHeaderCannotReachRealAccounts(t *testing.T) {
 	srv, app := newTestApp(t, true)
-	signIn(t, srv, app, "google-x", "x@example.com")
+	signIn(t, srv, app, "auth0|x", "x@example.com")
 	var realID string
-	app.db.QueryRow(`SELECT id FROM users WHERE google_sub = 'google-x'`).Scan(&realID)
+	app.db.QueryRow(`SELECT id FROM users WHERE auth_sub = 'auth0|x'`).Scan(&realID)
 
 	anon := &http.Client{}
 	if code, _ := call(t, anon, "GET", srv.URL+"/api/me", "", "X-User", realID); code != 401 {
@@ -192,9 +197,12 @@ func TestDemoOffRequiresSignIn(t *testing.T) {
 
 func TestBadStateIsRejected(t *testing.T) {
 	srv, app := newTestApp(t, false)
-	app.google = &oauth2.Config{ClientID: "id", ClientSecret: "s", Endpoint: oauth2.Endpoint{AuthURL: "http://x/auth", TokenURL: "http://x/token"}}
+	t.Setenv("AUTH0_DOMAIN", "example.auth0.com")
+	t.Setenv("AUTH0_CLIENT_ID", "id")
+	t.Setenv("AUTH0_CLIENT_SECRET", "s")
+	app.auth = newAuth0(srv.URL)
 	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	res, err := c.Get(srv.URL + "/auth/google/callback?code=x&state=forged")
+	res, err := c.Get(srv.URL + "/auth/callback?code=x&state=forged")
 	if err != nil {
 		t.Fatal(err)
 	}

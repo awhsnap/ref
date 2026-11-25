@@ -41,12 +41,12 @@ func main() {
 	app := &App{
 		db:      db,
 		baseURL: baseURL,
-		google:  newGoogleConfig(baseURL),
+		auth:    newAuth0(baseURL),
 		demo:    demo,
 		secure:  strings.HasPrefix(baseURL, "https://"),
 	}
-	if app.google == nil {
-		log.Printf("Google sign-in is off: set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to turn it on")
+	if app.auth == nil {
+		log.Printf("Sign-in is off: set AUTH0_DOMAIN, AUTH0_CLIENT_ID and AUTH0_CLIENT_SECRET to turn it on")
 	}
 	go app.autoSendLoop()
 

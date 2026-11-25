@@ -12,16 +12,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/oauth2"
 )
 
 type App struct {
 	db      *sql.DB
 	baseURL string
-	google  *oauth2.Config // nil when Google sign-in isn't configured
-	demo    bool           // allow the sample accounts without signing in
-	secure  bool           // send cookies over HTTPS only
+	auth    *authProvider // nil when Auth0 isn't configured
+	demo    bool          // allow the sample accounts without signing in
+	secure  bool          // send cookies over HTTPS only
 }
 
 type User struct {
@@ -34,7 +32,7 @@ type User struct {
 	Phone          string         `json:"phone"`
 	Email          string         `json:"email"`
 	SendMode       string         `json:"send_mode"`
-	GoogleSub      string         `json:"-"`
+	AuthSub        string         `json:"-"`
 	Picture        string         `json:"picture"`
 	Onboarded      bool           `json:"onboarded"`
 	InviteCode     sql.NullString `json:"-"`
@@ -48,7 +46,7 @@ func (u User) MarshalJSON() ([]byte, error) {
 		FacebookPage string `json:"facebook_page"`
 		Demo         bool   `json:"demo"`
 		InviteCode   string `json:"invite_code,omitempty"`
-	}{alias(u), u.DealershipName.String, u.FacebookPage.String, u.GoogleSub == "", inviteFor(u)})
+	}{alias(u), u.DealershipName.String, u.FacebookPage.String, u.AuthSub == "", inviteFor(u)})
 }
 
 func inviteFor(u User) string {
@@ -82,12 +80,12 @@ type querier interface {
 }
 
 const userCols = `u.id, u.name, u.role, u.dealership_id, COALESCE(d.name, NULLIF(u.workplace, '')), d.facebook_page, u.phone, u.email, u.send_mode,
-	u.google_sub, u.picture, u.onboarded, d.invite_code`
+	u.auth_sub, u.picture, u.onboarded, d.invite_code`
 
 func scanUser(sc interface{ Scan(...any) error }) (User, error) {
 	var u User
 	err := sc.Scan(&u.ID, &u.Name, &u.Role, &u.DealershipID, &u.DealershipName, &u.FacebookPage, &u.Phone, &u.Email, &u.SendMode,
-		&u.GoogleSub, &u.Picture, &u.Onboarded, &u.InviteCode)
+		&u.AuthSub, &u.Picture, &u.Onboarded, &u.InviteCode)
 	return u, err
 }
 
@@ -168,7 +166,7 @@ func pathID(r *http.Request) (int64, error) {
 
 // withUser resolves the signed-in user from the session cookie. In demo mode,
 // a request with no session may pick one of the sample accounts with the
-// X-User header; real (Google) accounts can never be reached that way.
+// X-User header; real (Auth0) accounts can never be reached that way.
 func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var u User
@@ -177,7 +175,7 @@ func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) h
 			u, err = loadUser(a.db, id)
 		} else if demoID, _ := strconv.ParseInt(r.Header.Get("X-User"), 10, 64); a.demo && demoID != 0 {
 			u, err = loadUser(a.db, demoID)
-			if err == nil && u.GoogleSub != "" {
+			if err == nil && u.AuthSub != "" {
 				err = sql.ErrNoRows
 			}
 		} else {
@@ -257,7 +255,7 @@ func (a *App) listUsers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, users)
 		return
 	}
-	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.google_sub = '' ORDER BY u.id`)
+	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.auth_sub = '' ORDER BY u.id`)
 	if err != nil {
 		writeErr(w, err)
 		return

@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 )
 
 const (
@@ -25,21 +25,35 @@ const (
 	sessionTTL    = 30 * 24 * time.Hour
 )
 
-// userInfoURL is Google's OpenID Connect profile endpoint (a var for tests).
-var userInfoURL = "https://openidconnect.googleapis.com/v1/userinfo"
+// authProvider is an OpenID Connect login provider (Auth0).
+type authProvider struct {
+	oauth       *oauth2.Config
+	userInfoURL string
+	logoutURL   string // provider logout endpoint, without query
+}
 
-// newGoogleConfig returns nil when Google sign-in isn't configured.
-func newGoogleConfig(baseURL string) *oauth2.Config {
-	id, secret := env("GOOGLE_CLIENT_ID", ""), env("GOOGLE_CLIENT_SECRET", "")
-	if id == "" || secret == "" {
+// newAuth0 returns nil when Auth0 isn't configured.
+func newAuth0(baseURL string) *authProvider {
+	domain := strings.TrimSuffix(strings.TrimPrefix(env("AUTH0_DOMAIN", ""), "https://"), "/")
+	id, secret := env("AUTH0_CLIENT_ID", ""), env("AUTH0_CLIENT_SECRET", "")
+	if domain == "" || id == "" || secret == "" {
 		return nil
 	}
-	return &oauth2.Config{
-		ClientID:     id,
-		ClientSecret: secret,
-		RedirectURL:  strings.TrimRight(baseURL, "/") + "/auth/google/callback",
-		Scopes:       []string{"openid", "email", "profile"},
-		Endpoint:     google.Endpoint,
+	issuer := "https://" + domain
+	return &authProvider{
+		oauth: &oauth2.Config{
+			ClientID:     id,
+			ClientSecret: secret,
+			RedirectURL:  strings.TrimRight(baseURL, "/") + "/auth/callback",
+			Scopes:       []string{"openid", "email", "profile"},
+			Endpoint: oauth2.Endpoint{
+				AuthURL:   issuer + "/authorize",
+				TokenURL:  issuer + "/oauth/token",
+				AuthStyle: oauth2.AuthStyleInParams,
+			},
+		},
+		userInfoURL: issuer + "/userinfo",
+		logoutURL:   issuer + "/v2/logout",
 	}
 }
 
@@ -58,13 +72,13 @@ func hashToken(t string) string {
 
 func (a *App) authRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/config", a.authConfig)
-	mux.HandleFunc("GET /auth/google/login", a.googleLogin)
-	mux.HandleFunc("GET /auth/google/callback", a.googleCallback)
+	mux.HandleFunc("GET /auth/login", a.login)
+	mux.HandleFunc("GET /auth/callback", a.callback)
 	mux.HandleFunc("POST /auth/logout", a.logout)
 }
 
 func (a *App) authConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]bool{"google": a.google != nil, "demo": a.demo})
+	writeJSON(w, map[string]bool{"auth": a.auth != nil, "demo": a.demo})
 }
 
 func (a *App) setCookie(w http.ResponseWriter, name, value, path string, maxAge int) {
@@ -74,39 +88,42 @@ func (a *App) setCookie(w http.ResponseWriter, name, value, path string, maxAge 
 	})
 }
 
-func (a *App) googleLogin(w http.ResponseWriter, r *http.Request) {
-	if a.google == nil {
-		http.Error(w, "Google sign-in is not configured on this server.", http.StatusServiceUnavailable)
+// login sends the browser to Auth0's hosted login page. ?signup=1 opens it on
+// the sign-up tab.
+func (a *App) login(w http.ResponseWriter, r *http.Request) {
+	if a.auth == nil {
+		http.Error(w, "Sign-in is not configured on this server.", http.StatusServiceUnavailable)
 		return
 	}
 	state, verifier := randomToken(24), oauth2.GenerateVerifier()
-	a.setCookie(w, stateCookie, state+"."+verifier, "/auth/google", 600)
-	url := a.google.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier),
-		oauth2.SetAuthURLParam("prompt", "select_account"))
-	http.Redirect(w, r, url, http.StatusFound)
+	a.setCookie(w, stateCookie, state+"."+verifier, "/auth", 600)
+	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(verifier)}
+	if r.URL.Query().Get("signup") == "1" {
+		opts = append(opts, oauth2.SetAuthURLParam("screen_hint", "signup"))
+	}
+	http.Redirect(w, r, a.auth.oauth.AuthCodeURL(state, opts...), http.StatusFound)
 }
 
-type googleUser struct {
-	Sub           string `json:"sub"`
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
-	Name          string `json:"name"`
-	Picture       string `json:"picture"`
+type profile struct {
+	Sub     string `json:"sub"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	Picture string `json:"picture"`
 }
 
-func (a *App) googleCallback(w http.ResponseWriter, r *http.Request) {
+func (a *App) callback(w http.ResponseWriter, r *http.Request) {
 	fail := func(msg string, err error) {
 		if err != nil {
-			log.Printf("google callback: %s: %v", msg, err)
+			log.Printf("auth callback: %s: %v", msg, err)
 		}
 		http.Redirect(w, r, "/?auth_error="+msg, http.StatusFound)
 	}
-	if a.google == nil {
+	if a.auth == nil {
 		fail("not_configured", nil)
 		return
 	}
 	c, err := r.Cookie(stateCookie)
-	a.setCookie(w, stateCookie, "", "/auth/google", -1)
+	a.setCookie(w, stateCookie, "", "/auth", -1)
 	if err != nil {
 		fail("expired", err)
 		return
@@ -116,27 +133,24 @@ func (a *App) googleCallback(w http.ResponseWriter, r *http.Request) {
 		fail("state", nil)
 		return
 	}
-	if r.URL.Query().Get("error") != "" {
-		fail("cancelled", nil)
+	if e := r.URL.Query().Get("error"); e != "" {
+		// e.g. access_denied when the user cancels or a rule blocks them.
+		fail("cancelled", errors.New(e+": "+r.URL.Query().Get("error_description")))
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	tok, err := a.google.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
+	tok, err := a.auth.oauth.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
 	if err != nil {
 		fail("exchange", err)
 		return
 	}
-	gu, err := fetchGoogleUser(ctx, a.google.Client(ctx, tok))
-	if err != nil {
+	p, err := fetchProfile(ctx, a.auth.oauth.Client(ctx, tok), a.auth.userInfoURL)
+	if err != nil || p.Sub == "" {
 		fail("profile", err)
 		return
 	}
-	if gu.Sub == "" || !gu.EmailVerified {
-		fail("unverified", nil)
-		return
-	}
-	uid, err := a.upsertGoogleUser(gu)
+	uid, err := a.upsertUser(p)
 	if err != nil {
 		fail("account", err)
 		return
@@ -148,37 +162,37 @@ func (a *App) googleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func fetchGoogleUser(ctx context.Context, client *http.Client) (googleUser, error) {
-	var gu googleUser
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, userInfoURL, nil)
+func fetchProfile(ctx context.Context, client *http.Client, u string) (profile, error) {
+	var p profile
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	res, err := client.Do(req)
 	if err != nil {
-		return gu, err
+		return p, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return gu, fmt.Errorf("userinfo status %d", res.StatusCode)
+		return p, fmt.Errorf("userinfo status %d", res.StatusCode)
 	}
-	err = json.NewDecoder(res.Body).Decode(&gu)
-	return gu, err
+	err = json.NewDecoder(res.Body).Decode(&p)
+	return p, err
 }
 
-// upsertGoogleUser finds the account for a Google identity, creating it on
+// upsertUser finds the account for an Auth0 user id ("sub"), creating it on
 // first sign-in. New accounts start un-onboarded so they pick a plan.
-func (a *App) upsertGoogleUser(gu googleUser) (int64, error) {
-	name := strings.TrimSpace(gu.Name)
-	if name == "" {
-		name, _, _ = strings.Cut(gu.Email, "@")
+func (a *App) upsertUser(p profile) (int64, error) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" || name == p.Email {
+		name, _, _ = strings.Cut(p.Email, "@")
 	}
 	var id int64
-	err := a.db.QueryRow(`SELECT id FROM users WHERE google_sub = ?`, gu.Sub).Scan(&id)
+	err := a.db.QueryRow(`SELECT id FROM users WHERE auth_sub = ?`, p.Sub).Scan(&id)
 	switch {
 	case err == nil:
-		_, err = a.db.Exec(`UPDATE users SET email = ?, picture = ? WHERE id = ?`, gu.Email, gu.Picture, id)
+		_, err = a.db.Exec(`UPDATE users SET email = ?, picture = ? WHERE id = ?`, p.Email, p.Picture, id)
 		return id, err
 	case errors.Is(err, sql.ErrNoRows):
-		res, err := a.db.Exec(`INSERT INTO users(name, role, email, google_sub, picture, onboarded) VALUES (?, 'solo', ?, ?, ?, 0)`,
-			name, gu.Email, gu.Sub, gu.Picture)
+		res, err := a.db.Exec(`INSERT INTO users(name, role, email, auth_sub, picture, onboarded) VALUES (?, 'solo', ?, ?, ?, 0)`,
+			name, p.Email, p.Sub, p.Picture)
 		if err != nil {
 			return 0, err
 		}
@@ -219,7 +233,15 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 		a.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, hashToken(c.Value))
 	}
 	a.setCookie(w, sessionCookie, "", "/", -1)
-	writeJSON(w, map[string]bool{"ok": true})
+	// Also end the Auth0 session, so the next login asks again.
+	out := map[string]string{"logout_url": "/"}
+	if a.auth != nil {
+		out["logout_url"] = a.auth.logoutURL + "?" + url.Values{
+			"client_id": {a.auth.oauth.ClientID},
+			"returnTo":  {strings.TrimRight(a.baseURL, "/") + "/"},
+		}.Encode()
+	}
+	writeJSON(w, out)
 }
 
 func (a *App) cleanSessions() {

@@ -116,7 +116,7 @@ func migrate(db *sql.DB) error {
 	// Columns added after the first release. SQLite can't add a column
 	// twice, so check first.
 	added := []struct{ table, col, def string }{
-		{"users", "google_sub", "TEXT NOT NULL DEFAULT ''"},
+		{"users", "auth_sub", "TEXT NOT NULL DEFAULT ''"},
 		{"users", "picture", "TEXT NOT NULL DEFAULT ''"},
 		{"users", "onboarded", "INTEGER NOT NULL DEFAULT 1"},
 		{"dealerships", "invite_code", "TEXT NOT NULL DEFAULT ''"},
@@ -132,7 +132,7 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users(google_sub) WHERE google_sub <> '';
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_auth_sub ON users(auth_sub) WHERE auth_sub <> '';
 		CREATE INDEX IF NOT EXISTS customers_user ON customers(user_id);
 		CREATE INDEX IF NOT EXISTS messages_user ON messages(user_id, scheduled_date)`)
 	return err
@@ -238,7 +238,7 @@ func randomCode(r *rand.Rand) string {
 // seed fills an empty database with demo data dated around today.
 func seed(db *sql.DB, baseURL string) error {
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE google_sub = ''`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE auth_sub = ''`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
@@ -280,7 +280,7 @@ func seed(db *sql.DB, baseURL string) error {
 	today := time.Now()
 
 	var ids []int64
-	rows, err := tx.Query(`SELECT id FROM users WHERE google_sub = '' ORDER BY id`)
+	rows, err := tx.Query(`SELECT id FROM users WHERE auth_sub = '' ORDER BY id`)
 	if err != nil {
 		return err
 	}
