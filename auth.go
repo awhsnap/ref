@@ -1,61 +1,32 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"golang.org/x/oauth2"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
 	sessionCookie = "ref_session"
-	stateCookie   = "ref_oauth"
 	sessionTTL    = 30 * 24 * time.Hour
+	bcryptCost    = 12
+	minPassword   = 8
+	maxPassword   = 72 // bcrypt only uses the first 72 bytes
 )
-
-// authProvider is an OpenID Connect login provider (Auth0).
-type authProvider struct {
-	oauth       *oauth2.Config
-	userInfoURL string
-	logoutURL   string // provider logout endpoint, without query
-}
-
-// newAuth0 returns nil when Auth0 isn't configured.
-func newAuth0(baseURL string) *authProvider {
-	domain := strings.TrimSuffix(strings.TrimPrefix(env("AUTH0_DOMAIN", ""), "https://"), "/")
-	id, secret := env("AUTH0_CLIENT_ID", ""), env("AUTH0_CLIENT_SECRET", "")
-	if domain == "" || id == "" || secret == "" {
-		return nil
-	}
-	issuer := "https://" + domain
-	return &authProvider{
-		oauth: &oauth2.Config{
-			ClientID:     id,
-			ClientSecret: secret,
-			RedirectURL:  strings.TrimRight(baseURL, "/") + "/auth/callback",
-			Scopes:       []string{"openid", "email", "profile"},
-			Endpoint: oauth2.Endpoint{
-				AuthURL:   issuer + "/authorize",
-				TokenURL:  issuer + "/oauth/token",
-				AuthStyle: oauth2.AuthStyleInParams,
-			},
-		},
-		userInfoURL: issuer + "/userinfo",
-		logoutURL:   issuer + "/v2/logout",
-	}
-}
 
 func randomToken(n int) string {
 	b := make([]byte, n)
@@ -72,13 +43,15 @@ func hashToken(t string) string {
 
 func (a *App) authRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/config", a.authConfig)
-	mux.HandleFunc("GET /auth/login", a.login)
-	mux.HandleFunc("GET /auth/callback", a.callback)
+	mux.HandleFunc("POST /auth/register", a.register)
+	mux.HandleFunc("POST /auth/login", a.login)
 	mux.HandleFunc("POST /auth/logout", a.logout)
+	mux.HandleFunc("POST /api/password", a.withUser(a.changePassword))
+	mux.HandleFunc("POST /api/team/{id}/reset-password", a.withUser(a.resetTeamPassword))
 }
 
 func (a *App) authConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]bool{"auth": a.auth != nil, "demo": a.demo})
+	writeJSON(w, map[string]bool{"demo": a.demo})
 }
 
 func (a *App) setCookie(w http.ResponseWriter, name, value, path string, maxAge int) {
@@ -88,119 +61,370 @@ func (a *App) setCookie(w http.ResponseWriter, name, value, path string, maxAge 
 	})
 }
 
-// login sends the browser to Auth0's hosted login page. ?signup=1 opens it on
-// the sign-up tab.
-func (a *App) login(w http.ResponseWriter, r *http.Request) {
-	if a.auth == nil {
-		http.Error(w, "Sign-in is not configured on this server.", http.StatusServiceUnavailable)
-		return
-	}
-	state, verifier := randomToken(24), oauth2.GenerateVerifier()
-	a.setCookie(w, stateCookie, state+"."+verifier, "/auth", 600)
-	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(verifier)}
-	if r.URL.Query().Get("signup") == "1" {
-		opts = append(opts, oauth2.SetAuthURLParam("screen_hint", "signup"))
-	}
-	http.Redirect(w, r, a.auth.oauth.AuthCodeURL(state, opts...), http.StatusFound)
-}
+// ---- request protection ----
 
-type profile struct {
-	Sub     string `json:"sub"`
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	Picture string `json:"picture"`
-}
-
-func (a *App) callback(w http.ResponseWriter, r *http.Request) {
-	fail := func(msg string, err error) {
-		if err != nil {
-			log.Printf("auth callback: %s: %v", msg, err)
+// protect rejects cross-site writes (CSRF): every POST/PATCH/PUT/DELETE to
+// /api/ or /auth/ must come from this site and carry a JSON body type, which
+// a plain HTML form on another site can't send.
+func protect(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unsafe := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+		guarded := strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/")
+		if unsafe && guarded {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if u, err := url.Parse(origin); err != nil || u.Host != r.Host {
+					writeErr(w, httpError{http.StatusForbidden, "cross-site request blocked"})
+					return
+				}
+			} else if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+				writeErr(w, httpError{http.StatusForbidden, "cross-site request blocked"})
+				return
+			}
+			if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				writeErr(w, httpError{http.StatusUnsupportedMediaType, "send JSON"})
+				return
+			}
 		}
-		http.Redirect(w, r, "/?auth_error="+msg, http.StatusFound)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// limiter counts failed attempts per key in a sliding window.
+type limiter struct {
+	mu   sync.Mutex
+	hits map[string][]time.Time
+}
+
+func newLimiter() *limiter { return &limiter{hits: map[string][]time.Time{}} }
+
+func (l *limiter) recent(key string, window time.Duration) []time.Time {
+	cut := time.Now().Add(-window)
+	h := l.hits[key]
+	i := 0
+	for i < len(h) && h[i].Before(cut) {
+		i++
 	}
-	if a.auth == nil {
-		fail("not_configured", nil)
-		return
+	h = h[i:]
+	if len(h) == 0 {
+		delete(l.hits, key)
+	} else {
+		l.hits[key] = h
 	}
-	c, err := r.Cookie(stateCookie)
-	a.setCookie(w, stateCookie, "", "/auth", -1)
+	return h
+}
+
+// blocked reports whether key has max or more hits in window, and how long
+// until the oldest one expires.
+func (l *limiter) blocked(key string, max int, window time.Duration) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	h := l.recent(key, window)
+	if len(h) < max {
+		return false, 0
+	}
+	return true, time.Until(h[0].Add(window))
+}
+
+func (l *limiter) hit(key string) {
+	l.mu.Lock()
+	l.hits[key] = append(l.hits[key], time.Now())
+	l.mu.Unlock()
+}
+
+func (l *limiter) clear(key string) {
+	l.mu.Lock()
+	delete(l.hits, key)
+	l.mu.Unlock()
+}
+
+const (
+	loginWindow     = 15 * time.Minute
+	maxFailsPerUser = 8
+	maxFailsPerIP   = 30
+	maxSignupsPerIP = 10 // per hour
+)
+
+// clientIP prefers Fly's proxy header, which fly.io sets itself.
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("Fly-Client-IP"); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		fail("expired", err)
-		return
+		return r.RemoteAddr
 	}
-	state, verifier, ok := strings.Cut(c.Value, ".")
-	if !ok || state == "" || r.URL.Query().Get("state") != state {
-		fail("state", nil)
-		return
+	return host
+}
+
+func tooMany(wait time.Duration) error {
+	mins := int(wait.Minutes()) + 1
+	return httpError{http.StatusTooManyRequests, fmt.Sprintf("Too many attempts. Try again in %d minute%s.", mins, map[bool]string{true: "", false: "s"}[mins == 1])}
+}
+
+// ---- passwords ----
+
+func checkPasswordRules(pw string) error {
+	if len(pw) < minPassword {
+		return httpError{http.StatusBadRequest, fmt.Sprintf("Use at least %d characters for your password.", minPassword)}
 	}
-	if e := r.URL.Query().Get("error"); e != "" {
-		// e.g. access_denied when the user cancels or a rule blocks them.
-		fail("cancelled", errors.New(e+": "+r.URL.Query().Get("error_description")))
-		return
+	if len(pw) > maxPassword {
+		return httpError{http.StatusBadRequest, fmt.Sprintf("Use at most %d characters for your password.", maxPassword)}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	tok, err := a.auth.oauth.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
+	return nil
+}
+
+func hashPassword(pw string) (string, error) {
+	b, err := bcrypt.GenerateFromPassword([]byte(pw), bcryptCost)
+	return string(b), err
+}
+
+// dummyHash is compared against when an email isn't found, so a wrong email
+// takes as long as a wrong password.
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("not-a-real-password"), bcryptCost)
+
+func normalizeEmail(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	addr, err := mail.ParseAddress(s)
+	if err != nil || addr.Address != s || len(s) > 254 {
+		return "", httpError{http.StatusBadRequest, "Enter a valid email address."}
+	}
+	return s, nil
+}
+
+// tempPassword makes an easy-to-read one-time password.
+func tempPassword() string {
+	const letters = "abcdefghjkmnpqrstuvwxyz23456789"
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	for i := range b {
+		b[i] = letters[int(b[i])%len(letters)]
+	}
+	return string(b[:4]) + "-" + string(b[4:8]) + "-" + string(b[8:])
+}
+
+// ---- register, login ----
+
+func (a *App) register(w http.ResponseWriter, r *http.Request) {
+	if err := a.doRegister(w, r); err != nil {
+		writeErr(w, err)
+	}
+}
+
+func (a *App) doRegister(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	ipKey := "signup:" + clientIP(r)
+	if no, wait := a.limits.blocked(ipKey, maxSignupsPerIP, time.Hour); no {
+		return tooMany(wait)
+	}
+	email, err := normalizeEmail(in.Email)
 	if err != nil {
-		fail("exchange", err)
-		return
+		return err
 	}
-	p, err := fetchProfile(ctx, a.auth.oauth.Client(ctx, tok), a.auth.userInfoURL)
-	if err != nil || p.Sub == "" {
-		fail("profile", err)
-		return
+	name := strings.TrimSpace(in.Name)
+	if name == "" || len(name) > 80 {
+		return httpError{http.StatusBadRequest, "Enter your name."}
 	}
-	uid, err := a.upsertUser(p)
+	if err := checkPasswordRules(in.Password); err != nil {
+		return err
+	}
+	hash, err := hashPassword(in.Password)
 	if err != nil {
-		fail("account", err)
-		return
+		return err
 	}
+	res, err := a.db.Exec(`INSERT INTO users(name, role, email, password_hash, onboarded) VALUES (?, 'solo', ?, ?, 0)`, name, email, hash)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return httpError{http.StatusConflict, "An account with this email already exists. Try logging in."}
+		}
+		return err
+	}
+	a.limits.hit(ipKey)
+	uid, _ := res.LastInsertId()
 	if err := a.startSession(w, uid); err != nil {
-		fail("session", err)
-		return
+		return err
 	}
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-func fetchProfile(ctx context.Context, client *http.Client, u string) (profile, error) {
-	var p profile
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	res, err := client.Do(req)
+	u, err := loadUser(a.db, uid)
 	if err != nil {
-		return p, err
+		return err
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return p, fmt.Errorf("userinfo status %d", res.StatusCode)
-	}
-	err = json.NewDecoder(res.Body).Decode(&p)
-	return p, err
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, u)
+	return nil
 }
 
-// upsertUser finds the account for an Auth0 user id ("sub"), creating it on
-// first sign-in. New accounts start un-onboarded so they pick a plan.
-func (a *App) upsertUser(p profile) (int64, error) {
-	name := strings.TrimSpace(p.Name)
-	if name == "" || name == p.Email {
-		name, _, _ = strings.Cut(p.Email, "@")
+func (a *App) login(w http.ResponseWriter, r *http.Request) {
+	if err := a.doLogin(w, r); err != nil {
+		writeErr(w, err)
+	}
+}
+
+func (a *App) doLogin(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+	ipKey, userKey := "login-ip:"+clientIP(r), "login-user:"+email
+	if no, wait := a.limits.blocked(ipKey, maxFailsPerIP, loginWindow); no {
+		return tooMany(wait)
+	}
+	if no, wait := a.limits.blocked(userKey, maxFailsPerUser, loginWindow); no {
+		return tooMany(wait)
 	}
 	var id int64
-	err := a.db.QueryRow(`SELECT id FROM users WHERE auth_sub = ?`, p.Sub).Scan(&id)
-	switch {
-	case err == nil:
-		_, err = a.db.Exec(`UPDATE users SET email = ?, picture = ? WHERE id = ?`, p.Email, p.Picture, id)
-		return id, err
-	case errors.Is(err, sql.ErrNoRows):
-		res, err := a.db.Exec(`INSERT INTO users(name, role, email, auth_sub, picture, onboarded) VALUES (?, 'solo', ?, ?, ?, 0)`,
-			name, p.Email, p.Sub, p.Picture)
-		if err != nil {
-			return 0, err
-		}
-		return res.LastInsertId()
-	default:
-		return 0, err
+	var hash string
+	err := a.db.QueryRow(`SELECT id, password_hash FROM users WHERE lower(email) = ? AND is_demo = 0 AND password_hash <> ''`, email).Scan(&id, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		hash = string(dummyHash)
+	} else if err != nil {
+		return err
 	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.Password)) != nil || id == 0 {
+		a.limits.hit(ipKey)
+		a.limits.hit(userKey)
+		return httpError{http.StatusUnauthorized, "Email or password is incorrect."}
+	}
+	a.limits.clear(userKey)
+	if err := a.startSession(w, id); err != nil {
+		return err
+	}
+	u, err := loadUser(a.db, id)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, u)
+	return nil
 }
+
+// ---- password change and reset ----
+
+// changePassword sets a new password. The current one is needed unless the
+// account is on a temporary password.
+func (a *App) changePassword(w http.ResponseWriter, r *http.Request, u User) error {
+	if u.IsDemo {
+		return httpError{http.StatusForbidden, "Sample accounts don't have passwords."}
+	}
+	var in struct {
+		Current string `json:"current"`
+		New     string `json:"new"`
+	}
+	if err := decode(r, &in); err != nil {
+		return err
+	}
+	if !u.MustChangePW {
+		key := "pwchange:" + strconv.FormatInt(u.ID, 10)
+		if no, wait := a.limits.blocked(key, maxFailsPerUser, loginWindow); no {
+			return tooMany(wait)
+		}
+		var hash string
+		if err := a.db.QueryRow(`SELECT password_hash FROM users WHERE id = ?`, u.ID).Scan(&hash); err != nil {
+			return err
+		}
+		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.Current)) != nil {
+			a.limits.hit(key)
+			return httpError{http.StatusBadRequest, "Your current password is incorrect."}
+		}
+	}
+	if err := checkPasswordRules(in.New); err != nil {
+		return err
+	}
+	hash, err := hashPassword(in.New)
+	if err != nil {
+		return err
+	}
+	if _, err := a.db.Exec(`UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?`, hash, u.ID); err != nil {
+		return err
+	}
+	// Sign out everywhere else.
+	c, _ := r.Cookie(sessionCookie)
+	keep := ""
+	if c != nil {
+		keep = hashToken(c.Value)
+	}
+	if _, err := a.db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?`, u.ID, keep); err != nil {
+		return err
+	}
+	nu, err := loadUser(a.db, u.ID)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, nu)
+	return nil
+}
+
+// setTempPassword gives an account a one-time password that must be changed
+// at next sign-in, and signs it out everywhere.
+func setTempPassword(db *sql.DB, uid int64) (string, error) {
+	pw := tempPassword()
+	hash, err := hashPassword(pw)
+	if err != nil {
+		return "", err
+	}
+	if _, err := db.Exec(`UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?`, hash, uid); err != nil {
+		return "", err
+	}
+	if _, err := db.Exec(`DELETE FROM sessions WHERE user_id = ?`, uid); err != nil {
+		return "", err
+	}
+	return pw, nil
+}
+
+// resetTeamPassword lets a dealership manager reset a salesperson's password.
+func (a *App) resetTeamPassword(w http.ResponseWriter, r *http.Request, u User) error {
+	if u.Role != "manager" || u.IsDemo {
+		return httpError{http.StatusForbidden, "Only a dealership manager can reset passwords."}
+	}
+	id, err := pathID(r)
+	if err != nil {
+		return err
+	}
+	if id == u.ID {
+		return httpError{http.StatusBadRequest, "Change your own password in Settings."}
+	}
+	var dealer sql.NullInt64
+	var demo bool
+	if err := a.db.QueryRow(`SELECT dealership_id, is_demo FROM users WHERE id = ?`, id).Scan(&dealer, &demo); err != nil {
+		return err
+	}
+	if demo || !dealer.Valid || dealer != u.DealershipID {
+		return httpError{http.StatusNotFound, "not found"}
+	}
+	pw, err := setTempPassword(a.db, id)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, map[string]string{"temp_password": pw})
+	return nil
+}
+
+// resetPasswordCLI is the admin fallback for accounts with no manager:
+//
+//	fly ssh console -C "ref reset-password someone@example.com"
+func resetPasswordCLI(db *sql.DB, email string) (string, error) {
+	var id int64
+	err := db.QueryRow(`SELECT id FROM users WHERE lower(email) = lower(?) AND is_demo = 0`, strings.TrimSpace(email)).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("no account with email %q", email)
+	}
+	return setTempPassword(db, id)
+}
+
+// ---- sessions ----
 
 func (a *App) startSession(w http.ResponseWriter, uid int64) error {
 	tok := randomToken(32)
@@ -233,15 +457,7 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 		a.db.Exec(`DELETE FROM sessions WHERE token_hash = ?`, hashToken(c.Value))
 	}
 	a.setCookie(w, sessionCookie, "", "/", -1)
-	// Also end the Auth0 session, so the next login asks again.
-	out := map[string]string{"logout_url": "/"}
-	if a.auth != nil {
-		out["logout_url"] = a.auth.logoutURL + "?" + url.Values{
-			"client_id": {a.auth.oauth.ClientID},
-			"returnTo":  {strings.TrimRight(a.baseURL, "/") + "/"},
-		}.Encode()
-	}
-	writeJSON(w, out)
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (a *App) cleanSessions() {

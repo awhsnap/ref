@@ -116,7 +116,10 @@ func migrate(db *sql.DB) error {
 	// Columns added after the first release. SQLite can't add a column
 	// twice, so check first.
 	added := []struct{ table, col, def string }{
-		{"users", "auth_sub", "TEXT NOT NULL DEFAULT ''"},
+		{"users", "auth_sub", "TEXT NOT NULL DEFAULT ''"}, // legacy, unused
+		{"users", "password_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"},
+		{"users", "is_demo", "INTEGER NOT NULL DEFAULT 0"},
 		{"users", "picture", "TEXT NOT NULL DEFAULT ''"},
 		{"users", "onboarded", "INTEGER NOT NULL DEFAULT 1"},
 		{"dealerships", "invite_code", "TEXT NOT NULL DEFAULT ''"},
@@ -130,9 +133,16 @@ func migrate(db *sql.DB) error {
 			if _, err := db.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.col + ` ` + c.def); err != nil {
 				return err
 			}
+			if c.col == "is_demo" {
+				// Before this column, sample accounts were the ones with no
+				// outside login attached.
+				if _, err := db.Exec(`UPDATE users SET is_demo = 1 WHERE auth_sub = ''`); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_auth_sub ON users(auth_sub) WHERE auth_sub <> '';
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(lower(email)) WHERE is_demo = 0;
 		CREATE INDEX IF NOT EXISTS customers_user ON customers(user_id);
 		CREATE INDEX IF NOT EXISTS messages_user ON messages(user_id, scheduled_date)`)
 	return err
@@ -238,7 +248,7 @@ func randomCode(r *rand.Rand) string {
 // seed fills an empty database with demo data dated around today.
 func seed(db *sql.DB, baseURL string) error {
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE auth_sub = ''`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE is_demo = 1`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
@@ -264,10 +274,10 @@ func seed(db *sql.DB, baseURL string) error {
 	}
 
 	d := mustExec(`INSERT INTO dealerships(name, facebook_page) VALUES ('Sunset Motors', 'facebook.com/sunsetmotors-demo')`)
-	mustExec(`INSERT INTO users(name, role, phone, email, send_mode, workplace) VALUES ('Alex Rivera','solo','+15555550101','alex@example.com','tap','Bayside Auto')`)
-	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode) VALUES ('Jordan Lee','manager',?,'+15555550102','jordan@example.com','auto')`, d)
-	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode) VALUES ('Sam Patel','sales',?,'+15555550103','sam@example.com','tap')`, d)
-	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode) VALUES ('Maria Gomez','sales',?,'+15555550104','maria@example.com','tap')`, d)
+	mustExec(`INSERT INTO users(name, role, phone, email, send_mode, workplace, is_demo) VALUES ('Alex Rivera','solo','+15555550101','alex@example.com','tap','Bayside Auto',1)`)
+	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode, is_demo) VALUES ('Jordan Lee','manager',?,'+15555550102','jordan@example.com','auto',1)`, d)
+	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode, is_demo) VALUES ('Sam Patel','sales',?,'+15555550103','sam@example.com','tap',1)`, d)
+	mustExec(`INSERT INTO users(name, role, dealership_id, phone, email, send_mode, is_demo) VALUES ('Maria Gomez','sales',?,'+15555550104','maria@example.com','tap',1)`, d)
 	if err != nil {
 		return err
 	}
@@ -280,7 +290,7 @@ func seed(db *sql.DB, baseURL string) error {
 	today := time.Now()
 
 	var ids []int64
-	rows, err := tx.Query(`SELECT id FROM users WHERE auth_sub = '' ORDER BY id`)
+	rows, err := tx.Query(`SELECT id FROM users WHERE is_demo = 1 ORDER BY id`)
 	if err != nil {
 		return err
 	}

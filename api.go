@@ -17,9 +17,9 @@ import (
 type App struct {
 	db      *sql.DB
 	baseURL string
-	auth    *authProvider // nil when Auth0 isn't configured
-	demo    bool          // allow the sample accounts without signing in
-	secure  bool          // send cookies over HTTPS only
+	limits  *limiter // failed login/sign-up attempts
+	demo    bool     // allow the sample accounts without signing in
+	secure  bool     // send cookies over HTTPS only
 }
 
 type User struct {
@@ -32,7 +32,8 @@ type User struct {
 	Phone          string         `json:"phone"`
 	Email          string         `json:"email"`
 	SendMode       string         `json:"send_mode"`
-	AuthSub        string         `json:"-"`
+	IsDemo         bool           `json:"-"`
+	MustChangePW   bool           `json:"must_change_password"`
 	Picture        string         `json:"picture"`
 	Onboarded      bool           `json:"onboarded"`
 	InviteCode     sql.NullString `json:"-"`
@@ -46,7 +47,7 @@ func (u User) MarshalJSON() ([]byte, error) {
 		FacebookPage string `json:"facebook_page"`
 		Demo         bool   `json:"demo"`
 		InviteCode   string `json:"invite_code,omitempty"`
-	}{alias(u), u.DealershipName.String, u.FacebookPage.String, u.AuthSub == "", inviteFor(u)})
+	}{alias(u), u.DealershipName.String, u.FacebookPage.String, u.IsDemo, inviteFor(u)})
 }
 
 func inviteFor(u User) string {
@@ -80,12 +81,12 @@ type querier interface {
 }
 
 const userCols = `u.id, u.name, u.role, u.dealership_id, COALESCE(d.name, NULLIF(u.workplace, '')), d.facebook_page, u.phone, u.email, u.send_mode,
-	u.auth_sub, u.picture, u.onboarded, d.invite_code`
+	u.is_demo, u.must_change_password, u.picture, u.onboarded, d.invite_code`
 
 func scanUser(sc interface{ Scan(...any) error }) (User, error) {
 	var u User
 	err := sc.Scan(&u.ID, &u.Name, &u.Role, &u.DealershipID, &u.DealershipName, &u.FacebookPage, &u.Phone, &u.Email, &u.SendMode,
-		&u.AuthSub, &u.Picture, &u.Onboarded, &u.InviteCode)
+		&u.IsDemo, &u.MustChangePW, &u.Picture, &u.Onboarded, &u.InviteCode)
 	return u, err
 }
 
@@ -166,7 +167,7 @@ func pathID(r *http.Request) (int64, error) {
 
 // withUser resolves the signed-in user from the session cookie. In demo mode,
 // a request with no session may pick one of the sample accounts with the
-// X-User header; real (Auth0) accounts can never be reached that way.
+// X-User header; real accounts can never be reached that way.
 func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var u User
@@ -175,7 +176,7 @@ func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) h
 			u, err = loadUser(a.db, id)
 		} else if demoID, _ := strconv.ParseInt(r.Header.Get("X-User"), 10, 64); a.demo && demoID != 0 {
 			u, err = loadUser(a.db, demoID)
-			if err == nil && u.AuthSub != "" {
+			if err == nil && !u.IsDemo {
 				err = sql.ErrNoRows
 			}
 		} else {
@@ -185,7 +186,11 @@ func (a *App) withUser(h func(http.ResponseWriter, *http.Request, User) error) h
 			writeErr(w, httpError{http.StatusUnauthorized, "please sign in"})
 			return
 		}
-		if !u.Onboarded && r.URL.Path != "/api/me" && r.URL.Path != "/api/onboarding" {
+		switch {
+		case u.MustChangePW && r.URL.Path != "/api/me" && r.URL.Path != "/api/password":
+			writeErr(w, httpError{http.StatusForbidden, "choose a new password first"})
+			return
+		case !u.Onboarded && r.URL.Path != "/api/me" && r.URL.Path != "/api/onboarding" && r.URL.Path != "/api/password":
 			writeErr(w, httpError{http.StatusForbidden, "finish setting up your account first"})
 			return
 		}
@@ -255,7 +260,7 @@ func (a *App) listUsers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, users)
 		return
 	}
-	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.auth_sub = '' ORDER BY u.id`)
+	rows, err := a.db.Query(`SELECT ` + userCols + ` FROM users u LEFT JOIN dealerships d ON d.id = u.dealership_id WHERE u.is_demo = 1'' ORDER BY u.id`)
 	if err != nil {
 		writeErr(w, err)
 		return
