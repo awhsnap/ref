@@ -25,7 +25,9 @@ const state = {
 
 // ---------- API ----------
 async function api(path, opts = {}) {
-  const headers = { "X-User": String(state.user?.id || localStorage.getItem("demoUser") || 1) };
+  const headers = {};
+  const demoUser = localStorage.getItem("demoUser");
+  if (demoUser) headers["X-User"] = demoUser;
   if (opts.body && typeof opts.body !== "string") {
     opts.body = JSON.stringify(opts.body);
     headers["Content-Type"] = "application/json";
@@ -58,27 +60,135 @@ function modal(html, onMount) {
 function closeModal() { document.querySelector(".modal-bg")?.remove(); }
 
 // ---------- boot ----------
+const AUTH_ERRORS = {
+  cancelled: "Sign-in was cancelled.",
+  expired: "That sign-in took too long. Please try again.",
+  not_configured: "Sign-in isn't set up on this server yet.",
+};
+
 async function boot() {
-  state.users = await api("/api/users");
-  const saved = Number(localStorage.getItem("demoUser")) || 1;
-  const sw = $("#user-switch");
-  sw.innerHTML = state.users.map((u) =>
-    `<option value="${u.id}">${esc(u.name)} · ${u.role === "solo" ? "Solo salesperson" : u.role === "manager" ? "Dealership manager" : "Dealership salesperson"}</option>`).join("");
-  sw.value = saved;
-  sw.onchange = () => setUser(Number(sw.value));
+  state.cfg = await fetch("/api/auth/config").then((r) => r.json());
+  const authError = new URLSearchParams(location.search).get("auth_error");
+  if (authError) history.replaceState(null, "", "/");
   document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => go(b.dataset.view)));
-  await setUser(saved);
+  let me = null;
+  try { me = await api("/api/me"); } catch { localStorage.removeItem("demoUser"); }
+  if (!me) return renderSignIn(authError && (AUTH_ERRORS[authError] || "Sign-in didn't work. Please try again."));
+  state.user = me;
+  if (!me.onboarded) return renderOnboarding();
+  startApp();
+}
+
+function showChrome(on) {
+  $("#tabs").hidden = !on;
+}
+
+async function startApp() {
+  showChrome(true);
+  const acct = $("#account");
+  if (state.user.demo) {
+    state.users = await api("/api/users");
+    acct.innerHTML = `<span class="pill">Demo</span>
+      <select id="user-switch" aria-label="Demo account">${state.users.map((u) =>
+        `<option value="${u.id}">${esc(u.name)} · ${u.role === "solo" ? "Solo salesperson" : u.role === "manager" ? "Dealership manager" : "Dealership salesperson"}</option>`).join("")}</select>
+      <button class="btn small" id="exit-demo">Exit demo</button>`;
+    $("#user-switch").value = state.user.id;
+    $("#user-switch").onchange = () => setUser(Number($("#user-switch").value));
+    $("#exit-demo").onclick = () => { localStorage.removeItem("demoUser"); location.href = "/"; };
+  } else {
+    state.users = [state.user];
+    if (state.user.role === "manager") {
+      // The salesperson filter needs the team list.
+      const team = await api("/api/team");
+      state.users = team.map((t) => ({ id: t.id, name: t.name, dealership: state.user.dealership }));
+    }
+    acct.innerHTML = `${state.user.picture ? `<img class="avatar" src="${esc(state.user.picture)}" alt="" referrerpolicy="no-referrer">` : ""}
+      <span class="small"><b>${esc(state.user.name)}</b></span>
+      <button class="btn small" id="sign-out">Sign out</button>`;
+    $("#sign-out").onclick = signOut;
+  }
+  afterUserChange();
+}
+
+async function signOut() {
+  localStorage.removeItem("demoUser");
+  const res = await fetch("/auth/logout", { method: "POST" }).then((r) => r.json()).catch(() => ({}));
+  location.href = res.logout_url || "/";
 }
 
 async function setUser(id) {
   closeModal();
   localStorage.setItem("demoUser", id);
-  state.user = state.users.find((u) => u.id === id) || state.users[0];
   state.user = await api("/api/me");
+  afterUserChange();
+}
+
+function afterUserChange() {
   state.salesperson = "";
   $("#tabs [data-view=team]").hidden = state.user.role !== "manager";
   if (state.view === "team" && state.user.role !== "manager") state.view = "calendar";
   render();
+}
+
+function renderSignIn(error) {
+  showChrome(false);
+  $("#account").innerHTML = "";
+  const on = state.cfg.auth;
+  $("#view").innerHTML = `<div class="auth-card card">
+    <h1>Never forget a sold customer again.</h1>
+    <p class="muted">Referral Desk plans your follow-up texts, emails and Sold! posts, so referrals come in without the awkward ask.</p>
+    ${error ? `<p class="auth-error">${esc(error)}</p>` : ""}
+    ${on ? `<div class="row" style="justify-content:center;margin-top:8px">
+        <a class="btn primary" href="/auth/login">Log in</a>
+        <a class="btn" href="/auth/login?signup=1">Create an account</a>
+      </div>
+      <p class="muted small">Use your email, or Google if you prefer.</p>`
+    : `<p class="muted small">Sign-in isn't set up on this server yet.</p>`}
+    ${state.cfg.demo ? `<hr><button class="btn" id="try-demo">Try the demo with sample data</button>` : ""}
+  </div>`;
+  $("#try-demo") && ($("#try-demo").onclick = () => { localStorage.setItem("demoUser", "1"); location.reload(); });
+}
+
+function renderOnboarding() {
+  showChrome(false);
+  $("#account").innerHTML = `<button class="btn small" id="sign-out">Sign out</button>`;
+  $("#sign-out").onclick = signOut;
+  const u = state.user;
+  $("#view").innerHTML = `<div class="auth-card card" style="text-align:left">
+    <h2>Welcome! Let's set up your account.</h2>
+    <form id="ob">
+      <div class="plans">
+        <label class="plan"><input type="radio" name="plan" value="solo" checked><b>Just me</b><span>Solo salesperson · $29/month</span></label>
+        <label class="plan"><input type="radio" name="plan" value="dealership"><b>My dealership</b><span>I'm a manager setting up the team · $35/seat</span></label>
+        <label class="plan"><input type="radio" name="plan" value="join"><b>Join my team</b><span>My manager gave me an invite code</span></label>
+      </div>
+      <label>Your name<input name="name" value="${esc(u.name)}" required></label>
+      <label>Mobile phone<input name="phone" type="tel" placeholder="+1 555 555 0123"></label>
+      <label data-for="solo">Dealership you work at<input name="workplace" placeholder="e.g. Bayside Auto"></label>
+      <label data-for="dealership" hidden>Dealership name<input name="dealership_name" placeholder="e.g. Sunset Motors"></label>
+      <label data-for="join" hidden>Invite code<input name="invite_code" placeholder="8 letters, e.g. K7PQ2M9X" style="text-transform:uppercase"></label>
+      <p class="auth-error" id="ob-err" hidden></p>
+      <button class="btn primary" type="submit">Start using Referral Desk</button>
+    </form>
+  </div>`;
+  const form = $("#ob");
+  const sync = () => {
+    const plan = form.plan.value;
+    form.querySelectorAll("[data-for]").forEach((el) => (el.hidden = el.dataset.for !== plan));
+  };
+  form.querySelectorAll("[name=plan]").forEach((r) => (r.onchange = sync));
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const body = Object.fromEntries(new FormData(form));
+    try {
+      state.user = await api("/api/onboarding", { method: "POST", body });
+      startApp();
+      if (state.user.role === "manager") toast(`Team invite code: ${state.user.invite_code}`);
+    } catch (e) {
+      $("#ob-err").textContent = e.message;
+      $("#ob-err").hidden = false;
+    }
+  };
 }
 
 function go(view) { state.view = view; render(); }
@@ -90,6 +200,7 @@ function render() {
 }
 
 function banner() {
+  if (!state.user.demo) return "";
   return `<div class="banner">Demo with sample data. Texts, emails and posts are simulated, nothing is actually sent to customers.</div>`;
 }
 
@@ -547,12 +658,18 @@ async function renderSettings() {
         : "Messages go out on their own from a registered business number at 10am, and replies come back into the app."}</p>
       <p class="muted small">Texts only go to customers who agreed. No texts before 8am or after 9pm. STOP replies cancel all future texts automatically.</p>
     </div>
+    ${u.role === "manager" && u.invite_code ? `<div class="card" style="margin-bottom:12px">
+      <h3 style="margin-top:0">Invite your salespeople</h3>
+      <p class="small">Have each salesperson create an account, pick <b>Join my team</b>, and enter this code:</p>
+      <div class="row"><code class="invite">${esc(u.invite_code)}</code><button class="btn small" id="copy-invite">Copy</button></div>
+    </div>` : ""}
     <div class="card">
       <h3 style="margin-top:0">Social posting</h3>
       <p class="small">${u.role === "solo"
         ? "Sold! posts are shared from your phone to your personal Facebook or Instagram."
         : `Sold! posts go to <b>${esc(u.facebook_page || "your dealership Page")}</b> automatically (after Meta approves the app).`}</p>
     </div>`;
+  $("#copy-invite") && ($("#copy-invite").onclick = async () => { await navigator.clipboard?.writeText(u.invite_code); toast("Invite code copied"); });
   document.querySelectorAll("#mode [data-m]").forEach((b) => (b.onclick = async () => {
     state.user = await api("/api/me", { method: "PATCH", body: { send_mode: b.dataset.m } });
     toast("Saved"); render();

@@ -10,6 +10,9 @@ primary_region = "lax"
   TZ = "America/Los_Angeles"
   # Set to your app's public address so referral links point to it:
   BASE_URL = "https://ref-referral-demo.fly.dev"
+  # 1 = show the "Try the demo" sample accounts on the sign-in page.
+  DEMO_MODE = "1"
+  # Sign-in: set with `fly secrets set AUTH0_DOMAIN=... AUTH0_CLIENT_ID=... AUTH0_CLIENT_SECRET=...`
 
 [mounts]
   source = "ref_data"

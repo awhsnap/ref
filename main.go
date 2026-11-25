@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -30,11 +31,23 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
-	if err := seed(db, baseURL); err != nil {
-		log.Fatalf("seed: %v", err)
+	demo := env("DEMO_MODE", "1") == "1"
+	if demo {
+		if err := seed(db, baseURL); err != nil {
+			log.Fatalf("seed: %v", err)
+		}
 	}
 
-	app := &App{db: db, baseURL: baseURL}
+	app := &App{
+		db:      db,
+		baseURL: baseURL,
+		auth:    newAuth0(baseURL),
+		demo:    demo,
+		secure:  strings.HasPrefix(baseURL, "https://"),
+	}
+	if app.auth == nil {
+		log.Printf("Sign-in is off: set AUTH0_DOMAIN, AUTH0_CLIENT_ID and AUTH0_CLIENT_SECRET to turn it on")
+	}
 	go app.autoSendLoop()
 
 	static, _ := fs.Sub(staticFiles, "static")

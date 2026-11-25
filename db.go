@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_date ON messages(scheduled_date);
 
+CREATE TABLE IF NOT EXISTS sessions (
+	token_hash TEXT PRIMARY KEY,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS referrals (
 	id          INTEGER PRIMARY KEY,
 	customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -104,7 +110,31 @@ var defaultTemplates = []struct {
 }
 
 func migrate(db *sql.DB) error {
-	_, err := db.Exec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Columns added after the first release. SQLite can't add a column
+	// twice, so check first.
+	added := []struct{ table, col, def string }{
+		{"users", "auth_sub", "TEXT NOT NULL DEFAULT ''"},
+		{"users", "picture", "TEXT NOT NULL DEFAULT ''"},
+		{"users", "onboarded", "INTEGER NOT NULL DEFAULT 1"},
+		{"dealerships", "invite_code", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, c := range added {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.col).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.col + ` ` + c.def); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_auth_sub ON users(auth_sub) WHERE auth_sub <> '';
+		CREATE INDEX IF NOT EXISTS customers_user ON customers(user_id);
+		CREATE INDEX IF NOT EXISTS messages_user ON messages(user_id, scheduled_date)`)
 	return err
 }
 
@@ -208,7 +238,7 @@ func randomCode(r *rand.Rand) string {
 // seed fills an empty database with demo data dated around today.
 func seed(db *sql.DB, baseURL string) error {
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE auth_sub = ''`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
@@ -249,7 +279,18 @@ func seed(db *sql.DB, baseURL string) error {
 	replies := []string{"Loving it, thank you!", "All good so far 👍", "Quick question about Apple CarPlay", "Thanks! Will do.", "My brother is looking actually, I'll send him your way"}
 	today := time.Now()
 
-	for _, uid := range []int64{1, 3, 4, 2} {
+	var ids []int64
+	rows, err := tx.Query(`SELECT id FROM users WHERE auth_sub = '' ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, uid := range ids {
 		u, err := loadUser(tx, uid)
 		if err != nil {
 			return err
