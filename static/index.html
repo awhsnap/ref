@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Referral Desk</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="logo">Referral<span>Desk</span></div>
+    <div class="demo-switch">
+      Demo account
+      <select id="user-switch" aria-label="Demo account"></select>
+    </div>
+  </header>
+  <nav class="tabs" id="tabs">
+    <button data-view="calendar">Calendar</button>
+    <button data-view="customers">Customers</button>
+    <button data-view="referrals">Referrals</button>
+    <button data-view="templates">Follow-up plan</button>
+    <button data-view="team" hidden>Team</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+  <main id="view"></main>
+  <script src="/app.js"></script>
+</body>
+</html>
