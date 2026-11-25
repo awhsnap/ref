@@ -22,35 +22,26 @@ The calendar is the main screen. It shows every planned text, email and post, pl
 
 ## Accounts and sign-in
 
-Sign-in and sign-up go through [Auth0](https://auth0.com/)'s hosted login page, with email and password, plus Google or other social logins if you turn them on in Auth0. The sign-in page has **Log in** and **Create an account** buttons. The first time someone signs in, they pick a plan:
+Sign-up and login are built into the app, with an email and a password, and no outside sign-in service. The first time someone logs in, they pick a plan:
 
 - **Just me:** a solo salesperson account.
 - **My dealership:** creates a dealership with the person as its manager. Settings shows an 8-letter **invite code** for the team.
 - **Join my team:** a salesperson enters the manager's invite code and joins that dealership.
 
-The app uses OpenID Connect (authorization code flow with PKCE and a state check). Accounts are matched on Auth0's user id. App sessions last 30 days in an HttpOnly cookie. Signing out ends both the app session and the Auth0 session.
+How accounts are protected:
 
-**Demo mode** (`DEMO_MODE=1`, the default) adds a **Try the demo with sample data** button on the sign-in page. It opens the sample accounts with a switcher for a solo salesperson, a dealership manager and two salespeople. Sample accounts can never see or reach real accounts. Set `DEMO_MODE=0` to remove the button and turn off the sample accounts. Nothing in the demo is actually sent to anyone.
+- **Passwords:** stored only as bcrypt hashes (cost 12). They must be 8 to 72 characters. Emails are matched without regard to letter case.
+- **Sessions:** a random 256-bit token sits in an `HttpOnly`, `SameSite=Lax` cookie, which is `Secure` when `BASE_URL` is https. Only its SHA-256 hash is stored in SQLite. Sessions last 30 days, and logging out deletes them.
+- **Cross-site requests (CSRF):** every change request must come from the app's own site, checked with the `Origin` and `Sec-Fetch-Site` headers, and must be JSON, which a form on another website can't send.
+- **Login rate limits:** 8 failed tries per email and 30 per IP address in 15 minutes, and 10 sign-ups per IP address per hour. Unknown emails take as long to reject as wrong passwords. The counters are kept in memory, so they reset when the app restarts.
+- **Password changes:** changing your password in Settings signs you out on your other devices.
 
-### Setting up Auth0
+**Forgot password (for now):** there's no reset-by-email yet, because that needs an email provider. Until then:
 
-1. Sign up at [auth0.com](https://auth0.com/). The free plan covers this. A tenant is created for you, with a domain like `your-tenant.us.auth0.com`.
-2. Go to **Applications → Applications → Create Application**, choose **Regular Web Applications**, and open its **Settings** tab.
-3. Fill in these fields and save:
-   - **Allowed Callback URLs:** `https://<your-app>.fly.dev/auth/callback, http://localhost:8080/auth/callback`
-   - **Allowed Logout URLs:** `https://<your-app>.fly.dev/, http://localhost:8080/`
-   - **Allowed Web Origins:** `https://<your-app>.fly.dev`
-4. Under the application's **Connections** tab, turn on **Username-Password-Authentication** for email sign-up, and **google-oauth2** if you want "Continue with Google". For Google in production, add your own Google keys under **Authentication → Social**, because Auth0's built-in dev keys are for testing only.
-5. Optionally, under **Branding → Universal Login**, add your logo and colors.
-6. Copy the **Domain**, **Client ID** and **Client Secret** from the application's Settings and give them to the server:
+- A **dealership manager** can reset a salesperson's password from the **Team** page. The salesperson gets a one-time password and must choose a new one when they log in.
+- For anyone else (solo users, or managers), an admin runs: `fly ssh console -C "ref reset-password someone@example.com"`. It prints a one-time password that works the same way.
 
-```sh
-fly secrets set AUTH0_DOMAIN=your-tenant.us.auth0.com AUTH0_CLIENT_ID=... AUTH0_CLIENT_SECRET=...
-```
-
-Locally: `AUTH0_DOMAIN=... AUTH0_CLIENT_ID=... AUTH0_CLIENT_SECRET=... go run .`
-
-Without these settings, the server still runs, but the sign-in buttons are replaced with a note and only the demo works.
+**Demo mode** (`DEMO_MODE=1`, the default) adds a **Try the demo with sample data** button on the login page. The sample accounts have no passwords and can never see or reach real accounts. Set `DEMO_MODE=0` to turn them off.
 
 ## Run it locally
 
@@ -67,10 +58,7 @@ A `ref.db` SQLite file is created and filled with sample data on first run. Dele
 |---|---|---|
 | `PORT` | `8080` | Port to listen on |
 | `DB_PATH` | `ref.db` | SQLite file location |
-| `BASE_URL` | `http://localhost:8080` | Public address, used in referral links and the Auth0 callback and logout URLs. Cookies are HTTPS-only when it starts with `https://` |
-| `AUTH0_DOMAIN` | (none) | Your Auth0 domain, e.g. `your-tenant.us.auth0.com` |
-| `AUTH0_CLIENT_ID` | (none) | Auth0 application client ID |
-| `AUTH0_CLIENT_SECRET` | (none) | Auth0 application client secret (keep it in `fly secrets`, never in `fly.toml`) |
+| `BASE_URL` | `http://localhost:8080` | Public address, used in referral links. Cookies are HTTPS-only when it starts with `https://` |
 | `DEMO_MODE` | `1` | `1` shows the sample-data demo, `0` hides it |
 
 ## Deploy to fly.io
@@ -78,7 +66,6 @@ A `ref.db` SQLite file is created and filled with sample data on first run. Dele
 ```sh
 fly launch --no-deploy --copy-config   # pick your own app name, then update app + BASE_URL in fly.toml
 fly volumes create ref_data --size 1   # same region as primary_region
-fly secrets set AUTH0_DOMAIN=... AUTH0_CLIENT_ID=... AUTH0_CLIENT_SECRET=...
 fly deploy
 ```
 
@@ -92,7 +79,7 @@ The database lives on the `ref_data` volume at `/data/ref.db`, so it survives de
 
 - `main.go`: starts the server and serves the `static/` front end (embedded in the binary)
 - `api.go`: JSON API, the referral landing page, and the simulated auto-sender
-- `auth.go`: Auth0 sign-in, sessions, and first-time account setup (`auth_test.go` runs the whole flow against a fake Auth0)
+- `auth.go`: sign-up, login, sessions, password reset, CSRF and rate limiting, and first-time account setup (tested in `auth_test.go`)
 - `db.go`: SQLite schema, the default follow-up plan, and the demo data
 - `static/`: plain HTML, CSS and JavaScript, with no build step
 

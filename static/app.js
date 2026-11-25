@@ -28,10 +28,9 @@ async function api(path, opts = {}) {
   const headers = {};
   const demoUser = localStorage.getItem("demoUser");
   if (demoUser) headers["X-User"] = demoUser;
-  if (opts.body && typeof opts.body !== "string") {
-    opts.body = JSON.stringify(opts.body);
-    headers["Content-Type"] = "application/json";
-  }
+  if (opts.body && typeof opts.body !== "string") opts.body = JSON.stringify(opts.body);
+  // The server only accepts JSON for changes (blocks cross-site form posts).
+  if (opts.method && opts.method !== "GET") headers["Content-Type"] = "application/json";
   const res = await fetch(path, { ...opts, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || res.statusText);
@@ -60,22 +59,20 @@ function modal(html, onMount) {
 function closeModal() { document.querySelector(".modal-bg")?.remove(); }
 
 // ---------- boot ----------
-const AUTH_ERRORS = {
-  cancelled: "Sign-in was cancelled.",
-  expired: "That sign-in took too long. Please try again.",
-  not_configured: "Sign-in isn't set up on this server yet.",
-};
-
 async function boot() {
   state.cfg = await fetch("/api/auth/config").then((r) => r.json());
-  const authError = new URLSearchParams(location.search).get("auth_error");
-  if (authError) history.replaceState(null, "", "/");
   document.querySelectorAll("#tabs button").forEach((b) => (b.onclick = () => go(b.dataset.view)));
   let me = null;
   try { me = await api("/api/me"); } catch { localStorage.removeItem("demoUser"); }
-  if (!me) return renderSignIn(authError && (AUTH_ERRORS[authError] || "Sign-in didn't work. Please try again."));
+  if (!me) return renderSignIn();
   state.user = me;
-  if (!me.onboarded) return renderOnboarding();
+  route();
+}
+
+// route picks the right screen for a signed-in user.
+function route() {
+  if (state.user.must_change_password) return renderForcePassword();
+  if (!state.user.onboarded) return renderOnboarding();
   startApp();
 }
 
@@ -112,8 +109,8 @@ async function startApp() {
 
 async function signOut() {
   localStorage.removeItem("demoUser");
-  const res = await fetch("/auth/logout", { method: "POST" }).then((r) => r.json()).catch(() => ({}));
-  location.href = res.logout_url || "/";
+  await fetch("/auth/logout", { method: "POST", headers: { "Content-Type": "application/json" } }).catch(() => {});
+  location.href = "/";
 }
 
 async function setUser(id) {
@@ -130,23 +127,65 @@ function afterUserChange() {
   render();
 }
 
-function renderSignIn(error) {
+function renderSignIn(mode = "login") {
   showChrome(false);
   $("#account").innerHTML = "";
-  const on = state.cfg.auth;
+  const signup = mode === "signup";
   $("#view").innerHTML = `<div class="auth-card card">
     <h1>Never forget a sold customer again.</h1>
     <p class="muted">Referral Desk plans your follow-up texts, emails and Sold! posts, so referrals come in without the awkward ask.</p>
-    ${error ? `<p class="auth-error">${esc(error)}</p>` : ""}
-    ${on ? `<div class="row" style="justify-content:center;margin-top:8px">
-        <a class="btn primary" href="/auth/login">Log in</a>
-        <a class="btn" href="/auth/login?signup=1">Create an account</a>
-      </div>
-      <p class="muted small">Use your email, or Google if you prefer.</p>`
-    : `<p class="muted small">Sign-in isn't set up on this server yet.</p>`}
+    <div class="seg auth-tabs">
+      <button data-mode="login" class="${signup ? "" : "active"}">Log in</button>
+      <button data-mode="signup" class="${signup ? "active" : ""}">Create an account</button>
+    </div>
+    <form id="auth-form" style="text-align:left">
+      ${signup ? `<label>Your name<input name="name" autocomplete="name" required maxlength="80"></label>` : ""}
+      <label>Email<input name="email" type="email" autocomplete="email" required></label>
+      <label>Password<input name="password" type="password" required minlength="8" maxlength="72"
+        autocomplete="${signup ? "new-password" : "current-password"}">${signup ? `<span class="muted small">At least 8 characters.</span>` : ""}</label>
+      <p class="auth-error" id="auth-err" hidden></p>
+      <button class="btn primary" type="submit" style="width:100%;justify-content:center">${signup ? "Create my account" : "Log in"}</button>
+      ${signup ? "" : `<p class="muted small">Forgot your password? Ask your dealership manager to reset it from the Team page, or contact support.</p>`}
+    </form>
     ${state.cfg.demo ? `<hr><button class="btn" id="try-demo">Try the demo with sample data</button>` : ""}
   </div>`;
+  document.querySelectorAll(".auth-tabs [data-mode]").forEach((b) => (b.onclick = () => renderSignIn(b.dataset.mode)));
+  $("#auth-form").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const btn = ev.target.querySelector("button[type=submit]");
+    btn.disabled = true;
+    try {
+      state.user = await api(signup ? "/auth/register" : "/auth/login", { method: "POST", body: Object.fromEntries(new FormData(ev.target)) });
+      route();
+    } catch (e) {
+      $("#auth-err").textContent = e.message;
+      $("#auth-err").hidden = false;
+      btn.disabled = false;
+    }
+  };
   $("#try-demo") && ($("#try-demo").onclick = () => { localStorage.setItem("demoUser", "1"); location.reload(); });
+}
+
+function renderForcePassword() {
+  showChrome(false);
+  $("#account").innerHTML = `<button class="btn small" id="sign-out">Sign out</button>`;
+  $("#sign-out").onclick = signOut;
+  $("#view").innerHTML = `<div class="auth-card card" style="text-align:left">
+    <h2>Choose a new password</h2>
+    <p class="muted small">You signed in with a temporary password. Pick your own to continue.</p>
+    <form id="pw-form">
+      <label>New password<input name="new" type="password" autocomplete="new-password" required minlength="8" maxlength="72"></label>
+      <p class="auth-error" id="pw-err" hidden></p>
+      <button class="btn primary" type="submit">Save and continue</button>
+    </form>
+  </div>`;
+  $("#pw-form").onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      state.user = await api("/api/password", { method: "POST", body: { new: ev.target.new.value } });
+      route();
+    } catch (e) { $("#pw-err").textContent = e.message; $("#pw-err").hidden = false; }
+  };
 }
 
 function renderOnboarding() {
@@ -627,14 +666,32 @@ async function renderTemplates() {
 // ---------- team ----------
 async function renderTeam() {
   const team = await api("/api/team");
+  const canReset = !state.user.demo;
   $("#view").innerHTML = banner() + `
     <h2>${esc(state.user.dealership)} team</h2>
     <p class="muted small">Ranked by referral sales, then referrals in. Tip: pick a salesperson on the Calendar to see their schedule.</p>
     <div class="card" style="padding:0;overflow-x:auto"><table>
-      <thead><tr><th>#</th><th>Salesperson</th><th>Customers</th><th>Messages sent</th><th>Replies</th><th>Overdue</th><th>Referrals</th><th>Referral sales</th></tr></thead>
+      <thead><tr><th>#</th><th>Salesperson</th><th>Customers</th><th>Messages sent</th><th>Replies</th><th>Overdue</th><th>Referrals</th><th>Referral sales</th>${canReset ? "<th></th>" : ""}</tr></thead>
       <tbody>${team.map((t, i) => `<tr><td class="lb-rank">${i + 1}</td><td><b>${esc(t.name)}</b>${t.role === "manager" ? ' <span class="pill">Manager</span>' : ""}</td>
-        <td>${t.customers}</td><td>${t.sent}</td><td>${t.replies}</td><td>${t.overdue ? `<b style="color:var(--danger)">${t.overdue}</b>` : 0}</td><td>${t.referrals}</td><td><b>${t.referral_sales}</b></td></tr>`).join("")}</tbody>
+        <td>${t.customers}</td><td>${t.sent}</td><td>${t.replies}</td><td>${t.overdue ? `<b style="color:var(--danger)">${t.overdue}</b>` : 0}</td><td>${t.referrals}</td><td><b>${t.referral_sales}</b></td>
+        ${canReset ? `<td>${t.id !== state.user.id ? `<button class="btn small" data-reset="${t.id}" data-name="${esc(t.name)}">Reset password</button>` : ""}</td>` : ""}</tr>`).join("")}</tbody>
     </table></div>`;
+  document.querySelectorAll("[data-reset]").forEach((b) => (b.onclick = () => {
+    modal(`<h2>Reset ${esc(b.dataset.name)}'s password?</h2>
+      <p class="small">They'll be signed out everywhere and get a one-time password to give them. They choose a new one when they log in.</p>
+      <button class="btn primary" id="do-reset">Reset password</button>`, () => {
+      $("#do-reset").onclick = async () => {
+        try {
+          const r = await api(`/api/team/${b.dataset.reset}/reset-password`, { method: "POST" });
+          modal(`<h2>One-time password</h2>
+            <p class="small">Give this to ${esc(b.dataset.name)}. It won't be shown again.</p>
+            <div class="row"><code class="invite">${esc(r.temp_password)}</code><button class="btn small" id="copy-temp">Copy</button></div>`, () => {
+            $("#copy-temp").onclick = async () => { await navigator.clipboard?.writeText(r.temp_password); toast("Copied"); };
+          });
+        } catch (e) { toast(e.message); }
+      };
+    });
+  }));
 }
 
 // ---------- settings ----------
@@ -663,12 +720,29 @@ async function renderSettings() {
       <p class="small">Have each salesperson create an account, pick <b>Join my team</b>, and enter this code:</p>
       <div class="row"><code class="invite">${esc(u.invite_code)}</code><button class="btn small" id="copy-invite">Copy</button></div>
     </div>` : ""}
+    ${u.demo ? "" : `<div class="card" style="margin-bottom:12px">
+      <h3 style="margin-top:0">Password</h3>
+      <form id="chpw" class="grid2">
+        <label>Current password<input name="current" type="password" autocomplete="current-password" required></label>
+        <label>New password<input name="new" type="password" autocomplete="new-password" required minlength="8" maxlength="72"></label>
+        <div><button class="btn small primary" type="submit">Change password</button></div>
+      </form>
+      <p class="muted small">Changing it signs you out on your other devices.</p>
+    </div>`}
     <div class="card">
       <h3 style="margin-top:0">Social posting</h3>
       <p class="small">${u.role === "solo"
         ? "Sold! posts are shared from your phone to your personal Facebook or Instagram."
         : `Sold! posts go to <b>${esc(u.facebook_page || "your dealership Page")}</b> automatically (after Meta approves the app).`}</p>
     </div>`;
+  $("#chpw") && ($("#chpw").onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      await api("/api/password", { method: "POST", body: { current: ev.target.current.value, new: ev.target.new.value } });
+      ev.target.reset();
+      toast("Password changed");
+    } catch (e) { toast(e.message); }
+  });
   $("#copy-invite") && ($("#copy-invite").onclick = async () => { await navigator.clipboard?.writeText(u.invite_code); toast("Invite code copied"); });
   document.querySelectorAll("#mode [data-m]").forEach((b) => (b.onclick = async () => {
     state.user = await api("/api/me", { method: "PATCH", body: { send_mode: b.dataset.m } });

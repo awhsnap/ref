@@ -170,3 +170,5 @@ body.landing { display: grid; place-items: center; min-height: 100vh; padding: 1
 .plan span { font-weight: 400; color: var(--muted); }
 .plan:has(input:checked) { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand); }
 code.invite { font-size: 20px; letter-spacing: 2px; background: #f1f3f5; padding: 6px 12px; border-radius: 8px; }
+.auth-tabs { display: flex; margin: 16px 0; }
+.auth-tabs button { flex: 1; }

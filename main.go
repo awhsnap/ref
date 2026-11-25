@@ -5,6 +5,7 @@ package main
 import (
 	"database/sql"
 	"embed"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -31,6 +32,17 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
+	// Admin fallback: `ref reset-password someone@example.com` prints a
+	// one-time password for that account.
+	if len(os.Args) == 3 && os.Args[1] == "reset-password" {
+		pw, err := resetPasswordCLI(db, os.Args[2])
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Temporary password for %s: %s\nThey'll be asked to choose a new one when they log in.\n", os.Args[2], pw)
+		return
+	}
+
 	demo := env("DEMO_MODE", "1") == "1"
 	if demo {
 		if err := seed(db, baseURL); err != nil {
@@ -41,12 +53,9 @@ func main() {
 	app := &App{
 		db:      db,
 		baseURL: baseURL,
-		auth:    newAuth0(baseURL),
+		limits:  newLimiter(),
 		demo:    demo,
 		secure:  strings.HasPrefix(baseURL, "https://"),
-	}
-	if app.auth == nil {
-		log.Printf("Sign-in is off: set AUTH0_DOMAIN, AUTH0_CLIENT_ID and AUTH0_CLIENT_SECRET to turn it on")
 	}
 	go app.autoSendLoop()
 
@@ -56,7 +65,7 @@ func main() {
 	mux.Handle("GET /", http.FileServer(http.FS(static)))
 
 	log.Printf("listening on %s (db %s)", addr, dbPath)
-	srv := &http.Server{Addr: addr, Handler: logRequests(mux), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: logRequests(protect(mux)), ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
 
