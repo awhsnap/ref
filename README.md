@@ -84,6 +84,10 @@ fly deploy
 
 The database lives on the `ref_data` volume at `/data/ref.db`, so it survives deploys.
 
+### Automatic deploys
+
+`.github/workflows/fly-deploy.yml` runs the tests on every pull request, and deploys `main` to fly.io after every merge. On its first run it also creates the app and the `ref_data` volume. It needs a repository secret named `FLY_API_TOKEN`. A deploy token from `fly tokens create deploy -a <app>` is enough once the app exists. If your fly.io organization isn't `personal`, set a repository variable `FLY_ORG`. You can also start a deploy by hand from the repo's **Actions** tab ("Run workflow").
+
 ## How it's built
 
 - `main.go`: starts the server and serves the `static/` front end (embedded in the binary)
